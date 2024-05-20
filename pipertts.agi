@@ -1,0 +1,297 @@
+#!/usr/bin/env perl
+
+#
+# AGI script that uses the Piper TTS text to speech engine.
+#
+# Copyright (C) 2024, Sebastian Müller <thxgiving@gmail.com>
+#
+#
+# This program is free software, distributed under the terms of
+# the GNU General Public License Version 2. See the COPYING file
+# at the top of the source tree.
+#
+
+use strict;
+use warnings;
+use Encode qw(decode encode);
+use File::Basename;
+use File::Temp qw(tempfile);
+use File::Copy qw(move);
+use File::Path qw(make_path);
+use Digest::MD5 qw(md5_hex);
+use Carp;
+
+$| = 1;
+
+# ----------------------------- #
+#   User defined parameters:    #
+# ----------------------------- #
+my $default_model   = "en_US-amy-medium.onnx";
+my $default_speed   = 1;
+my $use_cache       = 1;
+my $cache_dir       = "/tmp";
+my $voices_dir      = dirname(__FILE__) . "/voices";
+my $samplerate      = "16000";
+my $fexten	    = "sln";
+my $sox_version     = "14";
+my $debug           = 1;
+# ----------------------------- #
+
+# AGI Variables
+my %AGI;
+my $text;
+my $intkey  = "";
+my $tmpdir  = "/tmp";
+my $maxlen  = 4096;
+my @temp_files;
+
+# Global Vars
+my $sox;
+my $soxargs;
+
+# Read AGI Environment
+($AGI{arg_1}, $AGI{arg_2}, $AGI{arg_3}, $AGI{arg_4}) = @ARGV;
+while (<STDIN>) {
+    chomp;
+    last if !length;
+    $AGI{$1} = $2 if /^agi_(\w+)\:\s+(.*)$/;
+}
+
+# Main Execution
+main();
+
+sub main {
+    sanitize_text();
+    set_parameters();
+    ensure_cache_path();
+    answer_channel();
+
+    my ($sox, $pipertts) = detect_required_programs();
+    
+    detect_sample_rate();
+    
+    # Select the appropriate voice file
+    my $voice = select_voice($default_model);
+
+    my $encoded_text = encode('utf8', $text);
+
+    process_text_to_speech($encoded_text, $voice, $sox, $pipertts);
+
+    clean_temp_files();
+    exit 0;
+}
+
+sub sanitize_text {
+    $AGI{arg_1} = decode('utf8', $AGI{arg_1});
+    $AGI{arg_1} =~ s/[\\|*~<>^\(\)\[\]\{\}[:cntrl:]]/ /g;
+    $AGI{arg_1} =~ s/\s+/ /g;
+    $AGI{arg_1} =~ s/^\s+|\s+$//g;
+    die "No text passed for synthesis.\n" unless length $AGI{arg_1};
+    $AGI{arg_1} .= '.' unless $AGI{arg_1} =~ /[.,?!:;]$/;
+    $text = $AGI{arg_1};
+}
+
+sub set_parameters {
+    $default_model = $AGI{arg_2} if length $AGI{arg_2};
+    $intkey        = $AGI{arg_3} eq 'any' ? '0123456789#*' : $AGI{arg_3} if length $AGI{arg_3};
+    $default_speed = $AGI{arg_4} if length $AGI{arg_4};
+}
+
+sub ensure_cache_path {
+    if ($use_cache && (length($cache_dir) + 32 + 6) < $maxlen) {
+        make_path($cache_dir) unless -d $cache_dir;
+    } else {
+        warn "Cache path size exceeds limit. Disabling cache.\n" if $debug;
+        $use_cache = 0;
+    }
+}
+
+sub answer_channel {
+    my @result = execute_command("CHANNEL STATUS");
+    if ($result[0] == 4) {
+        @result = execute_command("ANSWER");
+        die "Failed to answer channel.\n" if $result[0] != 0;
+    }
+}
+
+sub detect_required_programs {
+    my $sox = `which sox`;
+    my $pipertts = `which piper`;
+    chomp($sox, $pipertts);
+    die "sox or piper is missing. Aborting.\n" unless $sox && $pipertts;
+    return ($sox, $pipertts);
+}
+
+sub detect_sample_rate {
+    my ($fmt, $s_rate) = detect_format();
+    $fexten = $fmt;
+    $samplerate = $s_rate;
+}
+
+sub detect_format {
+    my @format;
+    my @reply = execute_command("GET FULL VARIABLE \${CHANNEL(audionativeformat)}");
+    for ($reply[1]) {
+        if (/silk|sln12/) { @format = ("sln12", 12000); }
+        elsif (/speex|slin|silk16|g722|siren7/) { @format = ("sln16", 16000); }
+        elsif (/speex|slin|celt32|siren14/) { @format = ("sln32", 32000); }
+        elsif (/celt|slin44/) { @format = ("sln44", 44100); }
+        elsif (/celt|slin48/) { @format = ("sln48", 48000); }
+        else { @format = ("sln", 8000); }
+    }
+    return @format;
+}
+
+
+sub select_voice {
+    my ($default_model) = @_;
+    my $voice;
+    if (-e "$voices_dir/$default_model") {
+        $voice = "$voices_dir/$default_model";
+    } else {
+
+	# Replace underscores with hyphens in the language code
+        my $language_code = $default_model;
+        $language_code =~ s/-/_/g;
+
+        # Search for fitting voice files based on language code and quality
+        my @voice_files = glob("$voices_dir/$language_code-*.onnx");
+
+        # Sort the filtered voice files based on quality, with high quality first
+        @voice_files = sort_voice_files_by_quality(@voice_files);
+
+        if (@voice_files) {
+            $voice = $voice_files[0];  # Use the first (highest quality) matching voice file
+        } else {
+            die "Voice file for $language_code not found.\n";
+        }
+    }
+
+    return $voice;
+}
+
+sub sort_voice_files_by_quality {
+    my @voice_files = @_;
+    return sort {
+        my ($quality_a) = $a =~ /-(\w+)\.onnx$/;
+        my ($quality_b) = $b =~ /-(\w+)\.onnx$/;
+        return quality_order($quality_b) <=> quality_order($quality_a);
+    } @voice_files;
+}
+
+sub quality_order {
+    my %quality_order = (
+        high   => 3,
+        medium => 2,
+        low    => 1,
+    );
+    my $quality = lc(shift);
+    return exists $quality_order{$quality} ? $quality_order{$quality} : 0;
+}
+
+sub process_text_to_speech {
+    my ($text, $voice, $sox, $pipertts) = @_;
+    my $filename = $use_cache ? md5_hex("$text.$default_model.$default_speed") : '';
+    if ($use_cache && -r "$cache_dir/$filename") {
+        play_cached_file("$cache_dir/$filename");
+        return;
+    }
+    my ($fh, $tmpname) = tempfile("piper_XXXXXX", DIR => $tmpdir, UNLINK => 0);
+    my $pipertts_cmd = "$pipertts -m $voice -f $tmpname --download-dir $tmpdir --data-dir $tmpdir";
+    warn "pipertts command: $text -> $pipertts_cmd\n" if $debug;
+
+    open my $in, "|-", $pipertts_cmd or die "Cannot open pipertts: $!";
+    print $in $text;
+    close $in;
+    push @temp_files, "$tmpname";
+    convert_and_play_audio($sox, $tmpname);
+}
+
+sub play_cached_file {
+    my ($file) = @_;
+    my $res = playback($file, $intkey);
+    die "Failed to play $file.\n" if $res < 0;
+}
+
+sub convert_and_play_audio {
+    my ($sox, $tmpname, $samplerate, $filename) = @_;
+    my @soxargs = get_sox_args("$tmpname", "$tmpname.$fexten", $sox);
+    system(@soxargs) == 0 or die "sox failed: $?\n";
+    warn "sox command: ".join(" ", @soxargs)."\n" if $debug; 
+    push @temp_files, "$tmpname.$fexten";
+    
+    my $res = playback("$tmpname", $intkey);
+    die "Playback failed.\n" if $res < 0;
+    
+    if ($use_cache) {
+        warn "Saving file $filename to cache\n" if $debug;
+        copy("$tmpname.$fexten", "$cache_dir/". md5_hex("$text.$default_model.$default_speed"));
+    }
+   
+} 
+
+sub execute_command {
+    my ($command) = @_;
+    
+    if (!defined $command || $command eq "") {
+        warn "No command provided to execute_command subroutine.\n" if $debug;
+        return (-1, -1);  # Return default values indicating failure
+    }
+
+    print "$command\n";
+    my $input = <STDIN>;
+    chomp $input;
+    my @values;
+    if ($input =~ /^200 result=(-?\d+)\s?(.*)$/) {
+        warn "Command returned: $input\n" if $debug;
+        @values = ($1, $2);
+    } else {
+        warn "Unexpected result: $input\n";
+        @values = (-1, -1);
+    }
+    return @values;
+}
+
+sub playback {
+    my ($file, $keys) = @_;
+    my @response = execute_command("EXEC Playback $file \"$keys\"\n");
+    if ($response[0] >= 32 && chr($response[0]) =~ /[\w*#]/) {
+        warn "Got digit ", chr($response[0]), "\n" if $debug;
+        execute_command("SET EXTENSION " . chr($response[0]));
+        execute_command("SET PRIORITY 1");
+    } elsif ($response[0] == -1) {
+        warn "Failed to play $file.\n" if $debug;
+    }
+    return $response[0];
+}
+
+sub get_sox_args {
+    my ($source_file, $dest_file, $sox) = @_;
+    my @soxargs = ($sox, $source_file, "-e", "signed-integer", "-b", "16","-c", "1", "-q", "-r", $samplerate, "-t", "raw", $dest_file);
+    if ($default_speed != 1) {
+        if ($sox_version >= 14) {
+            push @soxargs, ("tempo", "-s", $default_speed);
+        } else {
+            push @soxargs, ("stretch", 1 / $default_speed, "80");
+        }
+    }
+    return @soxargs;
+}
+
+sub handle_interrupt {
+    warn "Interrupt signal received, cleaning up...\n" if $debug;
+    clean_temp_files();
+    exit 1;
+}
+
+$SIG{'INT'} = \&handle_interrupt;
+$SIG{'HUP'} = \&handle_interrupt;
+
+sub clean_temp_files {
+    warn "Cleaning temp files.\n" if $debug;
+    unlink @temp_files;
+}
+
+END {
+    clean_temp_files();
+}
